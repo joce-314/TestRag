@@ -1,56 +1,84 @@
+from llama_index.storage.storage_context import StorageContext
+from llama_index.vector_stores import ChromaVectorStore
+import chromadb
 import streamlit as st
-from openai import OpenAI
+from langchain_community.llms import Bedrock
+from langchain_community.embeddings import BedrockEmbeddings
 
-# Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
+from llama_index.embeddings import LangchainEmbedding
+from llama_index import VectorStoreIndex, ServiceContext, set_global_service_context
+from llama_index.readers import SimpleWebPageReader
+
+
+bedrock_embedding = BedrockEmbeddings(
+    credentials_profile_name="eu-west-3",
+    model_id="amazon.titan-embed-text-v2"
+)
+embed_model = LangchainEmbedding(bedrock_embedding)
+
+model_kwargs = {
+    "max_tokens_to_sample": 4096,
+    "temperature": 0.5,
+    "top_k": 250,
+    "top_p": 1,
+    "stop_sequences": ["\n\nHuman:"],
+}
+llm = Bedrock(
+    credentials_profile_name="eu-west-3",
+    model_id="anthropic.claude-v2",
+    model_kwargs=model_kwargs
 )
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+service_context = ServiceContext.from_defaults(
+    llm=llm,
+    embed_model=embed_model,
+    system_prompt="You are an expert on the LlamaIndex Python library and your job is to answer technical questions. Assume that all questions are related to the LlamaIndex Python library. Keep your answers technical and based on facts – do not hallucinate features."
+)
+set_global_service_context(service_context)
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+st.title("Chat with the LlamaIndex Docs💬 📚")
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+if "message" not in st.session_state.keys():
+    st.session_state.messages = [
+        {"role": "assistant",
+            "content": "Ask me a question about LlamaIndex's open-source Python library!"}
+    ]
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
+@st.cache_resource(show_spinner=False)
+def load_data():
+    with st.spinner(text="Loading and indexing the LlamaIndex docs – hang tight! This should take 1-2 minutes."):
+        # reader = SimpleDirectoryReader(input_dir="./data", recursive=True)
+        reader = SimpleWebPageReader(html_to_text=True)
+        docs = reader.load_data([
+            "https://docs.llamaindex.ai/en/stable/examples/data_connectors/WebPageDemo.html"
+        ])
+        db = chromadb.PersistentClient(path="./llamaindex_chroma_db")
+        chorma_collection = db.get_or_create_collection('llamaindex_doc')
+        vector_store = ChromaVectorStore(chroma_collection=chorma_collection)
+        storage_context = StorageContext.from_defaults(
+            vector_store=vector_store)
+        index = VectorStoreIndex.from_documents(
+            docs, storage_context=storage_context)
+        return index
 
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
 
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
-        )
+index = load_data()
+chat_engine = index.as_chat_engine(
+    # chat_mode="condense_question", verbose=False)
+    chat_mode="condense_question")
 
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+if prompt := st.chat_input("Your question"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
+
+if st.session_state.messages[-1]["role"] != "assistant":
+    with st.chat_message("assistant"):
+        st.spinner("Thinking...")
+        response = chat_engine.chat(prompt).response
+        st.write(response)
+        message = {"role": "assistant", "content": response}
+        st.session_state.messages.append(message)
